@@ -278,6 +278,11 @@
       color: white;
     }
 
+    .quick-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     .loading {
       display: inline-block;
       width: 20px;
@@ -341,6 +346,8 @@
   <script type="text/babel">
     const { useState, useRef, useEffect } = React;
 
+    const API_BASE = "http://localhost:3000";
+
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
     function FinancialAnalyzer() {
@@ -348,9 +355,13 @@
       const [messages, setMessages] = useState([]);
       const [input, setInput] = useState('');
       const [loading, setLoading] = useState(false);
+      const [indexing, setIndexing] = useState(false);
       const [isDragging, setIsDragging] = useState(false);
-      const [documentContent, setDocumentContent] = useState('');
-      const [stats, setStats] = useState({ files: 0, pages: 0, queries: 0 });
+      // docId is what the backend uses to look up the indexed chunks for
+      // this document. Once we have it, chat questions send this instead
+      // of re-sending the whole document every time.
+      const [docId, setDocId] = useState(null);
+      const [stats, setStats] = useState({ files: 0, pages: 0, queries: 0, chunks: 0 });
       const fileInputRef = useRef(null);
       const messagesEndRef = useRef(null);
 
@@ -370,8 +381,40 @@
           fullText += `\n--- Page ${i} ---\n${pageText}\n`;
         }
 
-        setStats(prev => ({ ...prev, pages: pdf.numPages }));
+        setStats(prev => ({ ...prev, pages: prev.pages + pdf.numPages }));
         return fullText;
+      };
+
+      const addMessage = (content, role = 'assistant') => {
+        setMessages(prev => [...prev, { role, content, timestamp: Date.now() }]);
+      };
+
+      // After extracting text client-side, send it to the backend to be
+      // chunked and stored. This is fast (no AI calls involved) — it just
+      // splits text and hands back a docId we can reference later.
+      const indexDocument = async (extractedText) => {
+        setIndexing(true);
+        addMessage(`Indexing document, one moment...`, 'system');
+
+        try {
+          const res = await fetch(`${API_BASE}/api/index`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: extractedText })
+          });
+
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Indexing failed");
+
+          setDocId(data.docId);
+          setStats(prev => ({ ...prev, chunks: data.numChunks }));
+          addMessage(`Document ready! (${data.numChunks} sections indexed). Ask me anything about it.`, 'system');
+        } catch (err) {
+          console.error('Indexing error:', err);
+          addMessage(`Error indexing document: ${err.message}. Make sure your backend server is running at ${API_BASE}`, 'error');
+        } finally {
+          setIndexing(false);
+        }
       };
 
       const handleFileUpload = async (selectedFiles) => {
@@ -379,21 +422,22 @@
         setFiles(prev => [...prev, ...newFiles]);
         setStats(prev => ({ ...prev, files: prev.files + newFiles.length }));
 
-        let extractedText = documentContent;
+        let combinedText = '';
 
         for (const file of newFiles) {
           if (file.type === 'application/pdf') {
             addMessage(`Extracting text from ${file.name}...`, 'system');
             const text = await extractTextFromPDF(file);
-            extractedText += `\n\n=== ${file.name} ===\n${text}`;
+            combinedText += `\n\n=== ${file.name} ===\n${text}`;
           } else if (file.type === 'text/plain' || file.name.endsWith('.csv')) {
             const text = await file.text();
-            extractedText += `\n\n=== ${file.name} ===\n${text}`;
+            combinedText += `\n\n=== ${file.name} ===\n${text}`;
           }
         }
 
-        setDocumentContent(extractedText);
-        addMessage(`Successfully processed ${newFiles.length} document(s). You can now ask questions about the content.`, 'system');
+        if (combinedText.trim()) {
+          await indexDocument(combinedText);
+        }
       };
 
       const handleDrop = (e) => {
@@ -416,73 +460,51 @@
         setStats(prev => ({ ...prev, files: prev.files - 1 }));
       };
 
-      const addMessage = (content, role = 'assistant') => {
-        setMessages(prev => [...prev, { role, content, timestamp: Date.now() }]);
-      };
-
-      const callGroqAPI = async (userQuery) => {
-        const systemPrompt = `You are a financial document analysis expert. You have been provided with financial documents and your job is to analyze them and answer questions accurately.
-
-Available document content:
-${documentContent}
-
-Provide detailed, accurate analysis based on the document content. If asked to:
-- Summarize: Provide key financial metrics, trends, and insights
-- Extract data: Pull specific numbers, dates, and information
-- Analyze: Identify patterns, risks, opportunities
-- Compare: Highlight differences and similarities
-- Calculate: Perform financial calculations and ratios
-
-Always cite specific sections or page numbers when referencing the documents.`;
-
+      // Sends just the question + docId. The backend looks up the most
+      // relevant chunks for this docId and builds the prompt itself, so
+      // we never ship the whole document over the wire per question.
+      const callChatAPI = async (userQuery) => {
         try {
-          const response = await fetch("http://localhost:3000/api/chat", {
+          const response = await fetch(`${API_BASE}/api/chat`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json"
             },
             body: JSON.stringify({
               query: userQuery,
-              systemPrompt: systemPrompt
+              docId: docId
             })
           });
 
-          // Check if response is ok
           if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `HTTP error! status: ${response.status}`);
           }
 
-          // Check content type before parsing
           const contentType = response.headers.get("content-type");
           if (!contentType || !contentType.includes("application/json")) {
             const text = await response.text();
             console.error('Non-JSON response:', text);
-            throw new Error('Server returned non-JSON response. Make sure your backend server is running at http://localhost:3000');
+            throw new Error('Server returned non-JSON response. Make sure your backend server is running at ' + API_BASE);
           }
 
           const data = await response.json();
-          
-          // Handle different response structures
-          if (data.choices && data.choices[0] && data.choices[0].message) {
-            // Groq/OpenAI format
-            return data.choices[0].message.content;
-          } else if (data.content) {
-            // Direct content format
-            return typeof data.content === 'string' ? data.content : data.content[0];
-          } else if (data.response) {
-            // Alternative response format
+
+          if (data.response) {
             return data.response;
+          } else if (data.choices && data.choices[0] && data.choices[0].message) {
+            return data.choices[0].message.content;
           } else {
             console.error('Unexpected response format:', data);
             throw new Error('Unexpected API response format');
           }
         } catch (error) {
           console.error('API Error:', error);
-          
+
           if (error.message.includes('Failed to fetch')) {
-            throw new Error('Cannot connect to backend server. Please ensure:\n1. Your backend server is running at http://localhost:3000\n2. CORS is enabled on your backend\n3. The /api/chat endpoint exists');
+            throw new Error('Cannot connect to backend server. Please ensure:\n1. Your backend server is running at ' + API_BASE + '\n2. CORS is enabled on your backend\n3. The /api/chat endpoint exists');
           }
-          
+
           throw error;
         }
       };
@@ -490,8 +512,8 @@ Always cite specific sections or page numbers when referencing the documents.`;
       const handleSend = async () => {
         if (!input.trim() || loading) return;
 
-        if (!documentContent) {
-          addMessage('Please upload at least one financial document first.', 'system');
+        if (!docId) {
+          addMessage('Please upload and wait for a document to finish indexing first.', 'system');
           return;
         }
 
@@ -502,7 +524,7 @@ Always cite specific sections or page numbers when referencing the documents.`;
         setStats(prev => ({ ...prev, queries: prev.queries + 1 }));
 
         try {
-          const response = await callGroqAPI(userMessage);
+          const response = await callChatAPI(userMessage);
           addMessage(response, 'assistant');
         } catch (error) {
           addMessage(`Error: ${error.message}`, 'error');
@@ -525,6 +547,8 @@ Always cite specific sections or page numbers when referencing the documents.`;
         '📋 List all transactions'
       ];
 
+      const busy = loading || indexing;
+
       return (
         <div className="container">
           <div className="header">
@@ -542,6 +566,10 @@ Always cite specific sections or page numbers when referencing the documents.`;
               <div className="stat-label">Pages</div>
             </div>
             <div className="stat-card">
+              <div className="stat-value">{stats.chunks}</div>
+              <div className="stat-label">Indexed Sections</div>
+            </div>
+            <div className="stat-card">
               <div className="stat-value">{stats.queries}</div>
               <div className="stat-label">Queries</div>
             </div>
@@ -550,7 +578,7 @@ Always cite specific sections or page numbers when referencing the documents.`;
           <div className="main-content">
             <div className="card">
               <h2>📁 Upload Documents</h2>
-              
+
               <div
                 className={`upload-zone ${isDragging ? 'dragging' : ''}`}
                 onClick={() => fileInputRef.current?.click()}
@@ -588,7 +616,7 @@ Always cite specific sections or page numbers when referencing the documents.`;
                           </div>
                         </div>
                       </div>
-                      <button 
+                      <button
                         className="remove-btn"
                         onClick={() => removeFile(index)}
                       >
@@ -602,7 +630,7 @@ Always cite specific sections or page numbers when referencing the documents.`;
 
             <div className="card">
               <h2>💬 Ask Questions <span className="badge">RAG Enabled</span></h2>
-              
+
               <div className="chat-container">
                 <div className="messages">
                   {messages.length === 0 ? (
@@ -621,10 +649,10 @@ Always cite specific sections or page numbers when referencing the documents.`;
                       </div>
                     ))
                   )}
-                  {loading && (
+                  {busy && (
                     <div className="message assistant">
                       <div className="message-content">
-                        <div className="loading"></div> Analyzing...
+                        <div className="loading"></div> {indexing ? 'Indexing...' : 'Analyzing...'}
                       </div>
                     </div>
                   )}
@@ -639,12 +667,12 @@ Always cite specific sections or page numbers when referencing the documents.`;
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyPress={(e) => e.key === 'Enter' && handleSend()}
-                    disabled={loading}
+                    disabled={busy}
                   />
-                  <button 
+                  <button
                     className="send-btn"
                     onClick={handleSend}
-                    disabled={loading || !input.trim()}
+                    disabled={busy || !input.trim()}
                   >
                     {loading ? '...' : 'Send'}
                   </button>
@@ -661,7 +689,7 @@ Always cite specific sections or page numbers when referencing the documents.`;
                   key={idx}
                   className="quick-btn"
                   onClick={() => handleQuickAction(action)}
-                  disabled={!documentContent}
+                  disabled={!docId}
                 >
                   {action}
                 </button>
